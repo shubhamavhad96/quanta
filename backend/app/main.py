@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from .websearch import discover_urls_robust, gather_meta
 from .ollama_client import ollama_generate
+from .related import ddg_related
 
 BASE = os.path.dirname(__file__)
 DB_PATH = os.path.join(BASE, "..", "data", "index", "quanta.sqlite")
@@ -51,11 +52,9 @@ _vec = None
 _ann = None
 _RATE = {"limit_per_min": 60, "bucket": {}}
 _QUERY_COUNT = 0
-# Caches
 _QUERY_CACHE = LRUCacheTTL(capacity=256, ttl_sec=300)
 _POSTINGS_CACHE = PostingsCache(capacity=512, ttl_sec=600)
 
-# Feature flags / knobs
 VEC_ENABLED = os.environ.get("QUANTA_VEC_ENABLED", "1") == "1"
 VEC_WEIGHT = float(os.environ.get("QUANTA_VEC_WEIGHT", "0.35"))
 HYBRID_ON = os.environ.get("QUANTA_HYBRID", "1") == "1"
@@ -75,7 +74,6 @@ def _recency_boost(last_modified: int | None, crawled_at: int | None,
     return (1.0 - weight) + weight * base
 
 
-# ANN persistence paths
 ANN_INDEX_PATH = os.path.join(BASE, "..", "data", "index", "quanta.ann.bin")
 ANN_IDS_PATH = os.path.join(BASE, "..", "data", "index", "quanta.ann.ids.npy")
 
@@ -91,7 +89,7 @@ def get_ann():
     global _ann
     if _ann is None:
         _ann = ANNIndex(dim=384, space="cosine")
-    # auto-load if files exist and not yet ready
+
     if not _ann.is_ready() and os.path.exists(ANN_INDEX_PATH) and os.path.exists(ANN_IDS_PATH):
         try:
             _ann.load(ANN_INDEX_PATH, ANN_IDS_PATH)
@@ -113,12 +111,8 @@ def allow_request(ip: str) -> bool:
 
 
 def get_index():
-    # return a fresh connection per request to avoid cross-thread sqlite issues
+
     return InvertedIndex(DB_PATH)
-
-
-# remove cached ranker and always build fresh per request to avoid cross-thread sqlite issues
-# _ranker = None
 
 
 def get_ranker():
@@ -144,9 +138,6 @@ def build_index(folder: str | None = None):
     return {"message": "indexed", **idx.stats()}
 
 
-# Wipe-aware reindex
-
-
 @app.post("/reindex")
 def reindex(folder: str | None = None, wipe: bool = FQuery(False)):
     global _index, _ranker, _vec, _ann
@@ -163,8 +154,7 @@ def reindex(folder: str | None = None, wipe: bool = FQuery(False)):
     idx.reset()
     idx.build_from_folder(folder or RAW_PATH)
     idx.rebuild_blocks(block_size=128)
-    # no cached ranker; built fresh on each call
-    # _ranker = BM25Ranker(idx.conn)
+
     return {"message": "reindexed", **idx.stats(), "wiped": wipe}
 
 
@@ -189,7 +179,6 @@ def embed_all():
     return {"message": "embedded", "new_vectors": count}
 
 
-# ---- ANN endpoints ----
 @app.post("/ann/build")
 def ann_build():
     idx = get_index()
@@ -290,7 +279,6 @@ async def search(
         qobj = parse_query(q)
         q_terms = tokenize(q)
 
-        # ---- Hybrid recall pool with BMW + cache ----
         from .cache import normalize_query
         q_norm = normalize_query(q)
         ranked_pool = None
@@ -314,7 +302,6 @@ async def search(
         bm25_map = {d: s for d, s in ranked_pool}
         pool_ids = set(bm25_map.keys())
 
-        # ANN union (hybrid)
         if HYBRID_ON and VEC_ENABLED and get_ann().is_ready():
             vec = get_vec()
             q_emb = vec.embed([q])[0]
@@ -327,7 +314,6 @@ async def search(
         pool_ids_list = list(pool_ids)[:FINAL_POOL]
         pool = [(d, bm25_map.get(d, 0.0)) for d in pool_ids_list]
 
-        # Fallback: if pool is empty, try ANN-only or direct vector sim over all docs
         if VEC_ENABLED and not pool:
             vec = get_vec()
             q_emb = vec.embed([q])[0]
@@ -349,13 +335,11 @@ async def search(
                     top_idx = sims.argsort()[::-1][:FINAL_POOL]
                     pool = [(int(ids[i]), 0.0) for i in top_idx]
 
-        # Optional vector blend re-rank
         if VEC_ENABLED and pool:
             vec = get_vec()
             pool = vec.rerank(
                 q, pool, fetch_text_fn=lambda d: idx.read_doc_text(d))
 
-        # positions-based filtering for phrases and NEAR/k
         needed_terms = set(qobj["terms"]) | set(t for ph in qobj["phrases"] for t in tokenize(
             ph)) | set(x for abk in qobj["nears"] for x in (abk[0], abk[1]))
 
@@ -407,20 +391,16 @@ async def search(
                 filtered.append((d, s))
                 pass_starts[d] = start_pos
 
-        # metadata filters
         if site or lang or type:
             filtered = [(d, s) for (d, s)
                         in filtered if idx.filter_doc(d, site, lang, type)]
 
-        # facets on filtered pool
         pool_ids_filtered = [d for (d, _) in filtered]
         facets = idx.facet_counts(pool_ids_filtered, limit=6)
 
-        # paginate
         start_idx = max(0, (page - 1) * per_page)
         ranked_page = filtered[start_idx:start_idx + per_page]
 
-        # build snippets around best passage window
         results = []
         for doc_id, score in ranked_page:
             path, title = idx.get_doc_meta(doc_id)
@@ -432,7 +412,7 @@ async def search(
             q_terms = tokenize(q)
             title_clean, text_clean = idx.read_doc_text(doc_id)
             base_text = text_clean or raw
-            # recency boost
+
             meta = idx.conn.execute(
                 "SELECT last_modified, crawled_at FROM docs WHERE id= ?", (
                     doc_id,)
@@ -452,13 +432,12 @@ async def search(
 
         total_docs = idx.stats()["total_docs"]
 
-        # ---- Web discovery if few results ----
         web_links = []
         if discover and len(results) < 5:
             try:
                 urls = ddg_urls(q, limit=8)
                 web_links = await fetch_metadata(urls)
-                # Optionally ingest a few serially to grow local corpus later
+
                 for u in urls[:2]:
                     try:
                         await ingest_url(u)
@@ -467,7 +446,6 @@ async def search(
             except Exception:
                 web_links = []
 
-        # ---- AI Answer from local passages + web snippets ----
         ai_text = None
         try:
             passages = []
@@ -660,8 +638,7 @@ async def ensure_results(q: str, min_hits: int = 5, discover_limit: int = 12):
     discovered: list[str] = []
     if hits < min_hits:
         discovered = await discover_urls(q, limit_total=discover_limit)
-        # NOTE: Skip direct ingestion here to avoid cross-thread SQLite errors under async.
-        # Users can POST /ingest/url for any of the returned URLs from the client.
+
     pool2, _ = ranker.search_page(q, page=1, per_page=50)
     hits2 = len(pool2)
     virtual_slug = None
@@ -683,6 +660,10 @@ class WebLink(BaseModel):
     url: str
     title: str
     snippet: str
+    site: str
+    domain: str
+    favicon: str
+    published_at: str | None = None
 
 
 class WebSearchResponse(BaseModel):
@@ -702,7 +683,6 @@ async def search_web(q: str = Query(..., min_length=1, max_length=200), k: int =
     except Exception:
         links = []
 
-    # Rank snippets to favor programming sense when ambiguous
     def prog_score(w: dict) -> int:
         title = (w.get("title") or "").lower()
         snip = (w.get("snippet") or "").lower()
@@ -710,7 +690,7 @@ async def search_web(q: str = Query(..., min_length=1, max_length=200), k: int =
         for kw in ["programming", "software", "platform", "language", "jvm", "java community process"]:
             if kw in title or kw in snip:
                 hits += 1
-        # down-rank obvious non-programming signals
+
         for neg in ["island", "indonesia", "coffee"]:
             if neg in title or neg in snip:
                 hits -= 1
@@ -718,11 +698,10 @@ async def search_web(q: str = Query(..., min_length=1, max_length=200), k: int =
 
     links_sorted = sorted(links, key=prog_score, reverse=True)
 
-    # ------- AI answer from scraped snippets (grounded) -------
     ai = None
     if links_sorted:
         ctx_parts = []
-        for i, w in enumerate(links_sorted[:4], start=1):  # tighter context
+        for i, w in enumerate(links_sorted[:4], start=1):
             title = (w.get("title") or w["url"])[:140]
             snippet = (w.get("snippet") or "")[:450]
             ctx_parts.append(f"[{i}] {title}\n{snippet}")
@@ -739,16 +718,51 @@ Context:
 
 Rules:
 - 2–4 concise sentences.
-- Neutral tone.
-- Add citation markers like [1], [2] corresponding to the context items above.
+- Neutral, factual tone.
 - Do not invent facts outside the context.
 
 Answer:"""
         try:
             text = ollama_generate(prompt).strip()
+
+            import re as _re
+            text = _re.sub(r"\s*\[(?:\d+)(?:\s*,\s*\d+)*\]", "", text)
             ai = text if len(
                 text) >= 20 else "I don’t have enough evidence from these pages to answer confidently."
         except Exception as e:
             ai = f"(AI unavailable: {e})"
 
     return WebSearchResponse(query=q, ai=ai, web_results=[WebLink(**w) for w in links_sorted])
+
+
+@app.get("/related")
+def related(q: str, limit: int = 5):
+    return {"query": q, "questions": ddg_related(q, limit=limit)}
+
+
+@app.post("/qa")
+async def qa(question: str = Body(..., embed=True), k: int = 5):
+    urls = await discover_urls_robust(question, limit=k)
+    links = await gather_meta(urls)
+    if not links:
+        return {"answer": "I don't have enough evidence to answer that.", "sources": []}
+    ctx = "\n\n".join(
+        f"[{i+1}] {w['title']}\n{w['snippet']}" for i, w in enumerate(links[:k]))
+    prompt = f"""Answer the question using ONLY the context below. 2–3 concise sentences. 
+Add citation markers like [1], [2] that refer to the numbered sources.
+
+Question: {question}
+
+Context:
+{ctx}
+
+Answer:"""
+    try:
+        text = ollama_generate(prompt).strip()
+        if len(text) < 15:
+            text = "I don't have enough evidence to answer that."
+    except Exception as e:
+        text = f"(AI unavailable: {e})"
+    sources = [{"num": i+1, "title": w["title"], "url": w["url"]}
+               for i, w in enumerate(links[:k])]
+    return {"answer": text, "sources": sources}
