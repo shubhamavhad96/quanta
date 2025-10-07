@@ -1,0 +1,1 @@
+Search engines use inverted indexes and TF-IDF scoring to rank documents by relevance.

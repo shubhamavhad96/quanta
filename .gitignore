@@ -1,0 +1,26 @@
+# Node / Next.js
+node_modules/
+.next/
+*.log
+
+# Python / FastAPI
+backend/.venv/
+backend/__pycache__/
+backend/.pytest_cache/
+backend/*.sqlite
+backend/app/*.pyc
+
+# Environment files
+.env
+*.env
+frontend/.env.local
+backend/.env
+
+# OS
+.DS_Store
+
+# Build outputs
+*.cache
+coverage/
+dist/
+build/

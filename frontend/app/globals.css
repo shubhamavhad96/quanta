@@ -1,0 +1,6 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* tiny tweaks */
+.marked mark { background: #fde68a; padding: 0 .15rem; border-radius: .2rem; }

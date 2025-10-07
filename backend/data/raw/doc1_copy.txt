@@ -1,0 +1,1 @@
+Quanta is a tiny search engine. It reads files, builds a word map, and answers queries fast.
